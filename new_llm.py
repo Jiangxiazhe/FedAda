@@ -93,8 +93,16 @@ CNN = args.CNN
 
 if args.CNN=='roberta_base':
     model_path='./roberta_base'
-    tokenizer = RobertaTokenizer.from_pretrained(model_path)
-    model = RobertaForSequenceClassification.from_pretrained(model_path)
+    try:
+        tokenizer = RobertaTokenizer.from_pretrained(model_path)
+        model = RobertaForSequenceClassification.from_pretrained(model_path)
+    except:
+        model_name='roberta-base'
+        print(f"本地模型文件不完整，重新下载{model_name}")
+        tokenizer = RobertaTokenizer.from_pretrained(model_name)
+        model = RobertaForSequenceClassification.from_pretrained(model_name)
+        tokenizer.save_pretrained(model_path)
+        model.save_pretrained(model_path)
     lora_config = LoraConfig(
         r=args.r,  # LoRA attention dimension
         lora_alpha=args.r*2,  # Alpha scaling
@@ -251,7 +259,7 @@ if args.data_name=='sst2':
     def preprocess_function(examples):
         return tokenizer(examples["sentence"], truncation=True, padding="max_length", return_tensors="pt",max_length=64)
     dataset_path = './data/sst2'
-    dataset = load_dataset(dataset_path)
+    dataset = load_dataset("sst2", cache_dir=dataset_path)
     # 应用预处理
     tokenized_dataset = dataset.map(preprocess_function, batched=True)
     tokenized_dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
