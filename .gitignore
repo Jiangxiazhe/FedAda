@@ -1,0 +1,12 @@
+# 忽略所有 Python 缓存文件夹
+**/__pycache__/
+
+# 忽略特定路径下的模型权重文件
+roberta_base/model.safetensors
+
+# 忽略 data 文件夹下的特定数据集
+data/cifar-100/
+data/sst2/
+
+# 忽略整个 runs 文件夹（通常用于存放训练日志）
+runs/
