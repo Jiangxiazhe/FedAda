@@ -48,6 +48,7 @@ parser.add_argument('--weights', type=str, default='./swin_tiny_patch4_window7_2
                     help='initial weights path')
 parser.add_argument("--beta1", type=float, default=0.9, help="the perturbation radio for the SAM optimizer.")
 parser.add_argument("--beta2", type=float, default=0.999, help="the perturbation radio for the SAM optimizer.")
+parser.add_argument("--beta3", type=float, default=0.999, help="the perturbation radio for the SAM optimizer.")
 parser.add_argument("--pix", type=float, default=224, help="the perturbation radio for the SAM optimizer.")
 parser.add_argument("--eps", type=float, default=1e-8, help="the perturbation radio for the SAM optimizer.")
 parser.add_argument('--K', default=50, type=int, help='#workers')
@@ -763,6 +764,47 @@ class DataWorker(object):
             print('norm:', norm,'loss:',self.loss)
         return delta_w
 
+    def update_FedAdan(self, weights, E, index, lr):
+        self.model.load_state_dict(weights)
+        self.model.to(device)
+        self.data_id_loader(index)
+        for name, param in self.model.named_parameters():
+            if "classifier" in name or "head" in name:
+                param.requires_grad = True
+        self.optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad, self.model.parameters()), lr=lr, weight_decay=0)
+        self.loss = 0
+        step = 0
+        for e in range(E):
+            for batch_idx, (data, target) in enumerate(self.data_iterator):
+                if step >= args.K:
+                    break
+                step += 1
+                data = data.to(device)
+                target = target.to(device)
+                self.model.zero_grad()
+                output = self.model(data)
+                loss = self.criterion(output, target)
+                self.loss += loss.item() / args.K
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(parameters=self.model.parameters(), max_norm=10)
+                self.optimizer.step()
+        if args.lora == 1:
+            delta_w = {k: v.cpu() for k, v in self.model.state_dict().items() if 'lora' in k or "classifier" in k or "head" in k}
+            for k, v in self.model.state_dict().items():
+                if 'lora' in k or "classifier" in k or "head" in k:
+                    delta_w[k] = v.cpu() - weights[k]
+        else:
+            delta_w = {k: v.cpu() for k, v in self.model.state_dict().items()}
+            for k, v in self.model.state_dict().items():
+                delta_w[k] = v.cpu() - weights[k]
+        norm = 0
+        for k, v in self.model.named_parameters():
+            if k in delta_w.keys():
+                norm += torch.norm(delta_w[k], p=2)
+        if index % 10 == 0:
+            print('norm:', norm, 'loss:', self.loss)
+        return delta_w
+
     def update_fedavg_adamw_A(self, weights, E, index, momen_m, momen_v, lr, step):
         self.model.load_state_dict(weights)
         self.model.to(device)
@@ -1269,8 +1311,7 @@ class DataWorker(object):
             'FedLADA': self.update_FedLADA,
             'FedadamW_CM': self.update_FedadamW_CM,
             'FedAvg_adamw_AV': self.update_fedavg_adamw_AV,
-
-
+            'FedAdan': self.update_FedAdan,
         }
 
     def update_func(self, alg, weights, E, index, lr, ps_c=None, v=None, step=None, shared_state=None,ci=None):
@@ -1502,6 +1543,69 @@ def apply_weights_FedLADA(num_workers, weights,model,momen_m):
     return model.state_dict(),momen_m,momen_v
 
 
+@torch.no_grad()
+def apply_weights_FedAdan(num_workers, weights, model, g_prev, m_t, v_t, n_t, lr_ps, beta1, beta2, beta3, eps, tau, weight_decay):
+    model.to('cpu')
+    
+    g_t = {}
+    for weight in weights:
+        for k, v in weight.items():
+            if k in g_t.keys():
+                g_t[k] += v / (num_workers * selection)
+            else:
+                g_t[k] = v / (num_workers * selection)
+    
+    g_t_agg = {k: -v for k, v in g_t.items()}
+    
+    if m_t == {}:
+        m_t = {k: g_t_agg[k].clone() for k in g_t_agg.keys()}
+    else:
+        for k in g_t_agg.keys():
+            if k in m_t:
+                m_t[k] = (1 - beta1) * m_t[k] + beta1 * g_t_agg[k]
+            else:
+                m_t[k] = g_t_agg[k].clone()
+    
+    if g_prev == {}:
+        g_prev = {k: g_t_agg[k].clone() for k in g_t_agg.keys()}
+    
+    if v_t == {}:
+        v_t = {k: torch.zeros_like(g_t_agg[k]) for k in g_t_agg.keys()}
+    else:
+        for k in g_t_agg.keys():
+            if k in v_t:
+                v_t[k] = (1 - beta2) * v_t[k] + beta2 * (g_t_agg[k] - g_prev[k])
+            else:
+                v_t[k] = (g_t_agg[k] - g_prev[k]).clone()
+    
+    if n_t == {}:
+        n_t = {k: torch.full_like(g_t_agg[k], tau * tau) for k in g_t_agg.keys()}
+    else:
+        for k in g_t_agg.keys():
+            if k in n_t:
+                temp = g_t_agg[k] + (1 - beta2) * (g_t_agg[k] - g_prev[k])
+                n_t[k] = (1 - beta3) * n_t[k] + beta3 * (temp * temp)
+            else:
+                temp = g_t_agg[k] + (1 - beta2) * (g_t_agg[k] - g_prev[k])
+                n_t[k] = (temp * temp).clone()
+    
+    eta_t = {}
+    for k in n_t.keys():
+        eta_t[k] = lr_ps / (torch.sqrt(n_t[k]) + eps)
+    
+    ps_w = model.state_dict()
+    for k in ps_w.keys():
+        if k in eta_t:
+            update = eta_t[k] * (m_t[k] + (1 - beta2) * v_t[k])
+            ps_w[k] = (ps_w[k] - update) / (1 + weight_decay * lr_ps)
+    
+    model.load_state_dict(ps_w)
+    
+    g_prev = {k: g_t_agg[k].clone() for k in g_t_agg.keys()}
+    
+    return model.state_dict(), g_prev, m_t, v_t, n_t
+
+
 def apply_weights_avg3(num_workers, weights,model):
     model.to('cpu')
     m = [mi for _, mi,_ in weights]
@@ -1586,8 +1690,7 @@ if __name__ == "__main__":
         'FedadamW_CM',
         'FedAvg_adamw_AV',
         'FedAdamW',
-
-
+        'FedAdan',
     }
     #  配置logger
     import logging
@@ -1824,6 +1927,10 @@ if __name__ == "__main__":
     ps_c = {}
     m={}
     v = {}
+    g_prev = {}
+    m_t = {}
+    v_t = {}
+    n_t = {}
     div = []
     sim = []
     for epochidx in range(epoch_s, epoch):
@@ -1935,6 +2042,21 @@ if __name__ == "__main__":
                            zip(workers, index_sel)]
             weights=ray.get(weights)
             current_weights,momen_m,momen_v = apply_weights_adam(num_workers, weights,model,momen_m,momen_v)
+            model.load_state_dict(current_weights)
+            del weights
+
+        elif alg in {'FedAdan'}:
+            weights = []
+            n = int(num_workers * selection)
+            for i in range(0, n, int(n / args.p)):
+                index_sel = index[i:i + int(n / args.p)]
+                weights = [worker.update_func.remote(alg, current_weights, E, idx, lr) for worker, idx in
+                           zip(workers, index_sel)]
+            weights = ray.get(weights)
+            current_weights, g_prev, m_t, v_t, n_t = apply_weights_FedAdan(
+                num_workers, weights, model, g_prev, m_t, v_t, n_t, 
+                lr_ps, args.beta1, args.beta2, args.beta3, args.eps, args.tau, args.alpha
+            )
             model.load_state_dict(current_weights)
             del weights
 
