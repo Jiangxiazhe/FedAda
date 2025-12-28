@@ -5,8 +5,13 @@
 roberta_base/model.safetensors
 
 # 忽略 data 文件夹下的特定数据集
-data/cifar-100/
+data/cifar-100-python/
 data/sst2/
+data/cifar-100-python.tar.gz
 
 # 忽略整个 runs 文件夹（通常用于存放训练日志）
 runs/
+plot/alg_*
+
+# 忽略数据划分
+num_workers_*

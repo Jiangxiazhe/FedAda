@@ -242,7 +242,7 @@ python new_llm.py \
   --freeze 1 \
   --beta1 0.9 \
   --beta2 0.999 \
-  --r 16 \
+  --r 32 \
   --lora 1 \
   --print 1
 ```

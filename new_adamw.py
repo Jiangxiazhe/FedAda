@@ -1664,7 +1664,7 @@ if __name__ == "__main__":
     ci_dict = {}
 
     # 创建一个 SharedState Actor 实例
-    shared_state = SharedState.remote()
+    # shared_state = SharedState.remote()
     #ps = ParameterServer.remote(lr_ps, alg, tau, selection, data_name, num_workers)
     if data_name == 'imagenet':
         model = ConvNet200().to('cpu')
