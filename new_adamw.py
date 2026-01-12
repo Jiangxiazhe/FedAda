@@ -8,7 +8,7 @@ from datetime import datetime
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
+parser.add_argument('--lr', default=0.1, type=float, help='client learning rate')
 parser.add_argument('--lg', default=1.0, type=float, help='learning rate')
 parser.add_argument('--epoch', default=1001, type=int, help='number of epochs to train')
 parser.add_argument('--num_workers', default=100, type=int, help='#workers')
@@ -20,7 +20,7 @@ parser.add_argument('--gpu', default='0', type=str, help='use which gpus')
 parser.add_argument('--lr_decay', default='0.998', type=float, help='lr_decay')
 parser.add_argument('--data_name', default='CIFAR100', type=str, help='imagenet,CIFAR100')
 parser.add_argument('--tau', default='0.01', type=float, help='only for FedAdam ')
-parser.add_argument('--lr_ps', default='1', type=float, help='only for FedAdam ')
+parser.add_argument('--lr_ps', default='1', type=float, help='server learning rate')
 parser.add_argument('--alpha_value', default='0.1', type=float, help='for dirichlet')
 parser.add_argument('--selection', default='0.1', type=float, help=' C')
 parser.add_argument('--check', default=0, type=int, help=' if check')
@@ -50,7 +50,7 @@ parser.add_argument("--beta1", type=float, default=0.9, help="the perturbation r
 parser.add_argument("--beta2", type=float, default=0.999, help="the perturbation radio for the SAM optimizer.")
 parser.add_argument("--beta3", type=float, default=0.999, help="the perturbation radio for the SAM optimizer.")
 parser.add_argument("--pix", type=float, default=224, help="the perturbation radio for the SAM optimizer.")
-parser.add_argument("--eps", type=float, default=1e-8, help="the perturbation radio for the SAM optimizer.")
+parser.add_argument("--eps", type=float, default=1e-8, help="epsilon for the SAM optimizer.")
 parser.add_argument('--K', default=50, type=int, help='#workers')
 parser.add_argument('--freeze', default=1, type=int, help='# batch_size')
 
@@ -1546,48 +1546,49 @@ def apply_weights_FedLADA(num_workers, weights,model,momen_m):
 @torch.no_grad()
 def apply_weights_FedAdan(num_workers, weights, model, g_prev, m_t, v_t, n_t, lr_ps, beta1, beta2, beta3, eps, tau, weight_decay):
     model.to('cpu')
-    
-    g_t = {}
+
+    # 聚合客户端更新
+    delta_w_agg = {}
     for weight in weights:
         for k, v in weight.items():
-            if k in g_t.keys():
-                g_t[k] += v / (num_workers * selection)
+            if k in delta_w_agg.keys():
+                delta_w_agg[k] += v / (num_workers * selection)
             else:
-                g_t[k] = v / (num_workers * selection)
+                delta_w_agg[k] = v / (num_workers * selection)
+
+    # 计算聚合梯度: g_t = -1/|S_t| * sum(Δx_{i,t})
+    g_t_agg = {k: -v for k, v in delta_w_agg.items()}
     
-    g_t_agg = {k: -v for k, v in g_t.items()}
-    
-    if m_t == {}:
-        m_t = {k: g_t_agg[k].clone() for k in g_t_agg.keys()}
-    else:
-        for k in g_t_agg.keys():
-            if k in m_t:
-                m_t[k] = (1 - beta1) * m_t[k] + beta1 * g_t_agg[k]
-            else:
-                m_t[k] = g_t_agg[k].clone()
-    
+    # 将 g_prev 初始化为零（对应算法中的 g_{-1}=0）
     if g_prev == {}:
-        g_prev = {k: g_t_agg[k].clone() for k in g_t_agg.keys()}
-    
-    if v_t == {}:
-        v_t = {k: torch.zeros_like(g_t_agg[k]) for k in g_t_agg.keys()}
-    else:
-        for k in g_t_agg.keys():
-            if k in v_t:
-                v_t[k] = (1 - beta2) * v_t[k] + beta2 * (g_t_agg[k] - g_prev[k])
-            else:
-                v_t[k] = (g_t_agg[k] - g_prev[k]).clone()
-    
-    if n_t == {}:
-        n_t = {k: torch.full_like(g_t_agg[k], tau * tau) for k in g_t_agg.keys()}
-    else:
-        for k in g_t_agg.keys():
-            if k in n_t:
-                temp = g_t_agg[k] + (1 - beta2) * (g_t_agg[k] - g_prev[k])
-                n_t[k] = (1 - beta3) * n_t[k] + beta3 * (temp * temp)
-            else:
-                temp = g_t_agg[k] + (1 - beta2) * (g_t_agg[k] - g_prev[k])
-                n_t[k] = (temp * temp).clone()
+        g_prev = {k: torch.zeros_like(g_t_agg[k]) for k in g_t_agg.keys()}
+
+    # 更新 m_t: m_t = (1-β₁)m_{t-1} + β₁g_t
+    # First iteration: m_0 = β₁g_0 (since m_{-1}=0)
+    for k in g_t_agg.keys():
+        if k not in m_t:
+            m_t[k] = beta1 * g_t_agg[k]
+        else:
+            m_t[k] = (1 - beta1) * m_t[k] + beta1 * g_t_agg[k]
+
+    # Update v_t: v_t = (1-β₂)v_{t-1} + β₂(g_t - g_{t-1})
+    # First iteration: v_0 = β₂(g_0 - g_{-1}) = β₂g_0 (since g_{-1}=0)
+    for k in g_t_agg.keys():
+        if k not in v_t:
+            v_t[k] = beta2 * (g_t_agg[k] - g_prev[k])
+        else:
+            v_t[k] = (1 - beta2) * v_t[k] + beta2 * (g_t_agg[k] - g_prev[k])
+
+    # Update n_t: n_t = (1-β₃)n_{t-1} + β₃[g_t + (1-β₂)(g_t - g_{t-1})]²
+    # Algorithm line 22 and 7: n_0 = τ²·1 (elementwise)
+    # Compute the term [g_t + (1-β₂)(g_t - g_{t-1})] first
+    for k in g_t_agg.keys():
+        temp = g_t_agg[k] + (1 - beta2) * (g_t_agg[k] - g_prev[k])
+        if k not in n_t:
+            # First iteration: initialize with tau^2
+            n_t[k] = torch.full_like(g_t_agg[k], tau * tau)
+        # Update n_t for all iterations (including after first initialization)
+        n_t[k] = (1 - beta3) * n_t[k] + beta3 * (temp * temp)
     
     eta_t = {}
     for k in n_t.keys():
@@ -1647,8 +1648,6 @@ if __name__ == "__main__":
     batch_size = args.batch_size
     lr = args.lr
     E = args.E
-    lr_decay = args.lr_decay  # for CIFAR10
-    # lr_decay = 1
     alg = args.alg
     data_name = args.data_name
     selection = args.selection
@@ -2024,8 +2023,8 @@ if __name__ == "__main__":
                 weights_ref = ray.put(current_weights)
                 # 然后传进去：
                 #worker.update_func.remote(alg, weights_ref, ...)
-                weights = [worker.update_func.remote(alg, weights_ref, E, idx, lr) for worker, idx in
-                           zip(workers, index_sel)]
+                weights.extend([worker.update_func.remote(alg, weights_ref, E, idx, lr) for worker, idx in
+                           zip(workers, index_sel)])
                 #weights = [worker.update_func.remote(alg, current_weights, E, idx, lr) for worker, idx in
                 #           zip(workers, index_sel)]
             weights=ray.get(weights)
@@ -2038,8 +2037,8 @@ if __name__ == "__main__":
             n = int(num_workers * selection)
             for i in range(0, n, int(n / args.p)):
                 index_sel = index[i:i + int(n / args.p)]
-                weights = [worker.update_func.remote(alg, current_weights, E, idx, lr) for worker, idx in
-                           zip(workers, index_sel)]
+                weights.extend([worker.update_func.remote(alg, current_weights, E, idx, lr) for worker, idx in
+                           zip(workers, index_sel)])
             weights=ray.get(weights)
             current_weights,momen_m,momen_v = apply_weights_adam(num_workers, weights,model,momen_m,momen_v)
             model.load_state_dict(current_weights)
@@ -2050,8 +2049,8 @@ if __name__ == "__main__":
             n = int(num_workers * selection)
             for i in range(0, n, int(n / args.p)):
                 index_sel = index[i:i + int(n / args.p)]
-                weights = [worker.update_func.remote(alg, current_weights, E, idx, lr) for worker, idx in
-                           zip(workers, index_sel)]
+                weights.extend([worker.update_func.remote(alg, current_weights, E, idx, lr) for worker, idx in
+                           zip(workers, index_sel)])
             weights = ray.get(weights)
             current_weights, g_prev, m_t, v_t, n_t = apply_weights_FedAdan(
                 num_workers, weights, model, g_prev, m_t, v_t, n_t, 
@@ -2149,4 +2148,5 @@ if __name__ == "__main__":
     save_name2 = save_name2 + '.pth'
     np.save(save_name, (x, result, result_loss, test_list_loss))
 
+    del workers
     ray.shutdown()

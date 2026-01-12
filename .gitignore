@@ -15,3 +15,6 @@ plot/alg_*
 
 # 忽略数据划分
 num_workers_*
+
+# trae文件
+.trae/
